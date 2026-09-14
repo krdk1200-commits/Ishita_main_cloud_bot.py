@@ -15,17 +15,20 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ==========================================
 # 1. ENVIRONMENT & SECURITY SETUP
 # ==========================================
-env_vars = {}
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8852520099:AAHEa2-BRMppD8ryDZeSP_VeBqS_GeKa_xw")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7313525418")
+
+# .env फ़ाइल बैकअप सपोर्ट
 if os.path.exists(".env"):
     with open(".env", "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                env_vars[k.strip()] = v.strip()
-
-BOT_TOKEN = env_vars.get("TELEGRAM_BOT_TOKEN", "8852520099:AAHEa2-BRMppD8ryDZeSP_VeBqS_GeKa_xw")
-CHAT_ID = env_vars.get("TELEGRAM_CHAT_ID", "7313525418")
+                if k.strip() == "TELEGRAM_BOT_TOKEN" and not os.environ.get("TELEGRAM_BOT_TOKEN"):
+                    BOT_TOKEN = v.strip()
+                elif k.strip() == "TELEGRAM_CHAT_ID" and not os.environ.get("TELEGRAM_CHAT_ID"):
+                    CHAT_ID = v.strip()
 
 def send_telegram_text(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -63,7 +66,7 @@ def get_adaptive_threshold():
             if len(trades) >= 5:
                 recent_losses = sum(1 for t in trades[-5:] if t.get("result") == "LOSS")
                 if recent_losses >= 3:
-                    return 72  # बाज़ार कठिन होने पर सख्त थ्रेशोल्ड
+                    return 72
                 elif recent_losses <= 1:
                     return 58
             return data.get("adaptive_threshold", 60)
@@ -82,6 +85,8 @@ def calculate_master_analytics(df: pd.DataFrame, step: int):
     # ATR (14)
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().iloc[-1]
+    if pd.isna(atr) or atr == 0:
+        atr = step * 0.4
 
     # RSI (14)
     delta = close.diff()
@@ -102,22 +107,21 @@ def calculate_master_analytics(df: pd.DataFrame, step: int):
     # Fibonacci Golden Zone (0.50 - 0.618)
     sw_high = high.tail(30).max()
     sw_low = low.tail(30).min()
-    f_diff = sw_high - sw_low
+    f_diff = sw_high - sw_low if sw_high != sw_low else 1.0
     fib_618 = sw_high - (f_diff * 0.618)
     fib_500 = sw_high - (f_diff * 0.500)
     c_fib_bull = close.iloc[-1] >= fib_618
     c_fib_bear = close.iloc[-1] <= fib_500
 
     # SMC - Liquidity Sweep & Fair Value Gap (FVG)
-    bull_fvg = low.iloc[-1] > high.iloc[-3]
-    bear_fvg = high.iloc[-1] < low.iloc[-3]
+    bull_fvg = low.iloc[-1] > high.iloc[-3] if len(df) >= 3 else False
+    bear_fvg = high.iloc[-1] < low.iloc[-3] if len(df) >= 3 else False
     liq_sweep_bull = low.iloc[-1] < low.iloc[-2] and close.iloc[-1] > low.iloc[-2]
     liq_sweep_bear = high.iloc[-1] > high.iloc[-2] and close.iloc[-1] < high.iloc[-2]
 
     c_smc_bull = bull_fvg or liq_sweep_bull
     c_smc_bear = bear_fvg or liq_sweep_bear
 
-    # Confluence Scoring
     bull_checks = [c_rsi_bull, c_ema_bull, c_fib_bull, c_smc_bull, close.iloc[-1] > ema21]
     bear_checks = [c_rsi_bear, c_ema_bear, c_fib_bear, c_smc_bear, close.iloc[-1] < ema21]
 
@@ -140,9 +144,10 @@ def run_5_otm_multi_matrix_scan():
 
     for name, cfg in assets.items():
         try:
-            df = yf.Ticker(cfg["ticker"]).history(period="5d", interval="5m")
-            if df.empty:
-                df = yf.Ticker(cfg["ticker"]).history(period="1mo")
+            ticker = yf.Ticker(cfg["ticker"])
+            df = ticker.history(period="5d", interval="5m")
+            if df.empty or len(df) < 20:
+                df = ticker.history(period="1mo")
             if df.empty:
                 continue
 
@@ -153,30 +158,29 @@ def run_5_otm_multi_matrix_scan():
             bull_conf, bear_conf, atr, b_fvg, s_fvg = calculate_master_analytics(df, step)
             pos = active_positions.get(name)
 
-            # 5 Call OTMs & 5 Put OTMs
             call_otms = [atm + (i * step) for i in range(1, 6)]
             put_otms  = [atm - (i * step) for i in range(1, 6)]
 
-            # 5-OTM Confluence Filter (कम से कम 4 स्ट्राइक्स अलाइन होने चाहिए)
-            call_otm_confluence = sum(1 for _ in call_otms if bull_conf >= threshold)
-            put_otm_confluence  = sum(1 for _ in put_otms if bear_conf >= threshold)
+            # स्ट्राइक-वाइज़ डिस्टेंस प्रोबेबिलिटी वेइंग
+            call_otm_confluence = sum(1 for i, st in enumerate(call_otms) if (bull_conf - (i * 2.5)) >= (threshold - 10))
+            put_otm_confluence  = sum(1 for i, st in enumerate(put_otms) if (bear_conf - (i * 2.5)) >= (threshold - 10))
 
-            # इमरजेंसी रिवर्सल एग्जिट
+            # 1. इमरजेंसी एग्जिट
             if pos == "LONG" and bear_conf >= 75:
-                send_telegram_text(f"🔵 *EMERGENCY EXIT TRIGGERED (LONG CLOSED)*\nAsset: `{name}`\nReason: Bearish Invalidation ({bear_conf}% Conf)\nCMP: ₹{spot}")
+                send_telegram_text(f"🔵 *EMERGENCY EXIT (LONG CLOSED)*\nAsset: `{name}`\nReason: Sudden Bearish Invalidation ({bear_conf}% Conf)\nCMP: ₹{spot}")
                 active_positions[name] = None
                 continue
             elif pos == "SHORT" and bull_conf >= 75:
-                send_telegram_text(f"🔵 *EMERGENCY EXIT TRIGGERED (SHORT CLOSED)*\nAsset: `{name}`\nReason: Bullish Invalidation ({bull_conf}% Conf)\nCMP: ₹{spot}")
+                send_telegram_text(f"🔵 *EMERGENCY EXIT (SHORT CLOSED)*\nAsset: `{name}`\nReason: Sudden Bullish Invalidation ({bull_conf}% Conf)\nCMP: ₹{spot}")
                 active_positions[name] = None
                 continue
 
-            # ज़ीरो-ओवरलैप एंट्री निष्पादन
+            # 2. निष्पादन (Zero-Overlap)
             if pos is None:
                 sl_pts = round(max(atr * 1.3, step * 0.45), 1)
                 tgt_pts = round(sl_pts * 2.6, 1)
 
-                if call_otm_confluence >= 4:
+                if call_otm_confluence >= 4 and bull_conf >= threshold:
                     active_positions[name] = "LONG"
                     msg = (
                         f"🟢 *INSTITUTIONAL BUY CALL (LONG ENTRY)*\n"
@@ -191,7 +195,7 @@ def run_5_otm_multi_matrix_scan():
                     )
                     send_telegram_text(msg)
 
-                elif put_otm_confluence >= 4:
+                elif put_otm_confluence >= 4 and bear_conf >= threshold:
                     active_positions[name] = "SHORT"
                     msg = (
                         f"🔴 *INSTITUTIONAL BUY PUT (SHORT ENTRY)*\n"
@@ -231,9 +235,8 @@ def tx3_news_worker():
                         publisher = item.get("publisher", "TX3 Market Wire")
                         link = item.get("link", "")
 
-                        # त्वरित सेंटिमेंट एनालिसिस
-                        bull_keywords = ["surge", "gain", "profit", "growth", "high", "buy", "deal", "positive"]
-                        bear_keywords = ["drop", "fall", "loss", "plunge", "decline", "sell", "inflation", "weak"]
+                        bull_keywords = ["surge", "gain", "profit", "growth", "high", "buy", "deal", "positive", "up"]
+                        bear_keywords = ["drop", "fall", "loss", "plunge", "decline", "sell", "inflation", "weak", "down"]
                         impact = "🟢 Bullish Impact" if any(w in title.lower() for w in bull_keywords) else \
                                  "🔴 Bearish Impact" if any(w in title.lower() for w in bear_keywords) else "⚪ Neutral"
 
@@ -247,21 +250,19 @@ def tx3_news_worker():
                         )
                         send_telegram_text(msg)
 
-                        # ऑडियो 1: अंग्रेज़ी
-                        eng_text = f"Market Alert for {symbol}. Headline: {title}. Expected market impact is {impact}."
+                        eng_text = f"Market Alert for {symbol}. Headline: {title}. Expected impact is {impact}."
                         tts_en = gTTS(text=eng_text, lang='en', slow=False)
                         tts_en.save("news_en.mp3")
                         send_telegram_audio("news_en.mp3", caption="🎙️ English News Audio Briefing")
 
-                        # ऑडियो 2: हिंदी
-                        hi_text = f"बाजार अलर्ट। {symbol} के लिए ताजा खबर। {title}। इस खबर का बाजार पर प्रभाव {impact} होने की संभावना है।"
+                        hi_text = f"बाजार अलर्ट। {symbol} के लिए समाचार। {title}। अपेक्षित प्रभाव {impact} है।"
                         tts_hi = gTTS(text=hi_text, lang='hi', slow=False)
                         tts_hi.save("news_hi.mp3")
                         send_telegram_audio("news_hi.mp3", caption="🎙️ हिंदी समाचार ऑडियो ब्रीफिंग")
 
             except Exception:
                 pass
-        time.sleep(60)
+        time.sleep(90)
 
 # ==========================================
 # 6. DAILY SCHEDULED 11-STRIKE PCR BRIEFING
@@ -296,13 +297,22 @@ def scheduled_daily_briefing():
     send_telegram_text("\n".join(report))
 
 # ==========================================
-# 7. RENDER.COM DUMMY HEALTH CHECK SERVER
+# 7. RENDER.COM HEALTH CHECK SERVER (GET + HEAD)
 # ==========================================
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"AI Master Trading Bot is running 24/7.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return  # कंसोल लॉग्स को साफ रखने के लिए
 
 def run_http_server():
     port = int(os.environ.get("PORT", 8080))
@@ -315,17 +325,17 @@ def run_http_server():
 if __name__ == "__main__":
     send_telegram_text("🚀 *AI Master Universal Cloud Bot Successfully Deployed!*\n24/7 Monitoring Active on Cloud.")
     
-    # 1. HTTP हेल्थ चेक सर्वर (Render के लिए)
+    # HTTP हेल्थ चेक सर्वर शुरू करें (Render के लिए)
     threading.Thread(target=run_http_server, daemon=True).start()
 
-    # 2. 24/7 TX3 न्यूज़ थ्रेड
+    # 24/7 न्यूज़ थ्रेड शुरू करें
     threading.Thread(target=tx3_news_worker, daemon=True).start()
 
-    # 3. शेड्यूल्ड ब्रीफिंग (10:00 और 13:00)
+    # शेड्यूलर सेट करें
     schedule.every().day.at("10:00").do(scheduled_daily_briefing)
     schedule.every().day.at("13:00").do(scheduled_daily_briefing)
 
-    # 4. मुख्य मार्केट स्कैन लूप
+    # मुख्य एनालिसिस लूप
     while True:
         schedule.run_pending()
         run_5_otm_multi_matrix_scan()
